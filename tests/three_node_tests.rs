@@ -5,12 +5,11 @@ use routing_chord::ChordState;
 use tokio::time::sleep;
 
 use tracing::debug;
-use tracing_test::traced_test;
 
 static TESTING_STABILIZE_INTERVAL: Duration = Duration::from_secs(5);
 
 #[tokio::test]
-#[traced_test]
+#[test_log::test]
 async fn three_nodes_proper_order() {
     let mut handles = Vec::new();
 
@@ -82,7 +81,7 @@ async fn three_nodes_proper_order() {
 }
 
 #[tokio::test]
-#[traced_test]
+#[test_log::test]
 async fn three_nodes_query_predecessor_of() {
     let mut handles = Vec::new();
 
@@ -160,7 +159,7 @@ async fn three_nodes_query_predecessor_of() {
 }
 
 #[tokio::test]
-#[traced_test]
+#[test_log::test]
 async fn three_nodes_query_successor_of() {
     let mut handles = Vec::new();
 

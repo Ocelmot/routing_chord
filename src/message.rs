@@ -17,7 +17,7 @@ pub(crate) enum ControlMessage {
     AddMember(PeerWriter<MemberMessage>),
     AddAssociate(PeerWriter<AssociateMessage>),
     ListenAt(ChordPrivateKey, Sender<Vec<u8>>),
-    ConnectTo(ChordPublicKey, Vec<u8>),
+    ConnectTo(ChordLocation, Vec<u8>),
     Debug,
     Predecessor(oneshot::Sender<Option<ChordPublicKey>>),
     Successor(oneshot::Sender<Option<ChordPublicKey>>),
@@ -131,19 +131,58 @@ pub(crate) enum MemberMessage {
     Request(u64, Request),
     Reply(u64, Reply),
 
-    // create alias
+    /// Alias message instructing host node to do some action (Moves in the reverse direction)
+    /// 
+    /// [AliasOperation]s are serialized, then encrypted, then signed.
     AliasOperation {
-        to: ChordPublicKey,
+        /// The Alias' host node that will perform the action
+        to: ChordLocation,
+
+        /// The node requesting the aliasing (possibly on behalf of another node)
         from: ChordPublicKey,
+
+        /// The details of the operation (to be decrypted by the 'to' private key)
         op: Vec<u8>,
+
+        /// Signature to verify the operation came from the 'from' private key
         sig: Vec<u8>,
     },
-    /// The location of the alias, the number of hops backwards through the chord, the data itself
-    Data {
+
+    AliasResponse {
+        /// The host fo the intermediate alias this is being sent to
+        /// 
+        /// Used to route the data through the chord.
         to: ChordLocation,
-        alias_id: ChordLocation,
-        hop_count: Option<u8>,
+
+        // Need to have the alias id that the message is being sent to, but aliases currently only hold a single dest (the host).
+        // The alias could route to the alias id directly, but then would need to do more trail routing, and could give away the end of the path.
+        // The alias could now hold both the host as well as the dest alias, but this would also give away the final step in the path.
+        // (if the alias and dest are equal it must be to the final step)
+        // Therefore there should be some kind of outgoing table that tracks which next hops have been contacted to use as a nat-like routing table
+        // This needs to be used in addition to the to-check to handle both cases where its newly routing or intermediate routing.
+
+        /// The alias this is being routed from
+        /// 
+        /// Used for the final step to find the listen path
+        from: ChordLocation,
+
+        /// The response itself
         data: Vec<u8>,
+    },
+
+    /// Route some data through the chord, to some alias.
+    Data {
+        /// The destination to route the data
+        to: ChordLocation,
+
+        /// The location of the alias that last relayed the message
+        alias_loc: ChordLocation,
+
+        /// Number of hops backward through the chord, when tail routing.
+        hop_count: Option<u8>,
+
+        /// The body of the message
+        body: Vec<u8>,
     },
 }
 

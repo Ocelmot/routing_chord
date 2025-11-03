@@ -18,4 +18,4 @@ chacha20poly1305 = "0.10.1"
 lru = "0.12.5"
 
 [dev-dependencies]
-tracing-test = { version = "0.2.5" , features = ["no-env-filter"]}
+test-log = {version = "0.2", features = ["trace"]}

@@ -5,10 +5,12 @@ use routing_chord::{id::ChordPrivateKey, ChordState};
 use tokio::time::sleep;
 
 use tracing::trace;
-use tracing_test::traced_test;
+
+static TESTING_STABILIZE_INTERVAL: Duration = Duration::from_secs(5);
+static TESTING_FIX_FINGERS_INTERVAL: Duration = Duration::from_secs(5);
 
 #[tokio::test]
-#[traced_test]
+#[test_log::test]
 async fn two_nodes_query_predecessor() {
     let mut chord_state_1 = ChordState::temp();
     chord_state_1.set_listen_addr("127.0.0.1:6200");
@@ -36,7 +38,7 @@ async fn two_nodes_query_predecessor() {
 }
 
 #[tokio::test]
-#[traced_test]
+#[test_log::test]
 async fn two_nodes_query_successor() {
     let mut chord_state_1 = ChordState::temp();
     chord_state_1.set_listen_addr("127.0.0.1:6210");
@@ -64,14 +66,18 @@ async fn two_nodes_query_successor() {
 }
 
 #[tokio::test]
-#[traced_test]
+#[test_log::test]
 async fn two_nodes_establish_alias() {
     let mut chord_state_1 = ChordState::temp();
     chord_state_1.set_listen_addr("127.0.0.1:6220");
+    chord_state_1.set_stabilize_interval(TESTING_STABILIZE_INTERVAL);
+    chord_state_1.set_fix_fingers_interval(TESTING_FIX_FINGERS_INTERVAL);
     let mut handle_1 = chord_state_1.host().expect("host should start");
 
     let mut chord_state_2 = ChordState::temp();
     chord_state_2.set_listen_addr("127.0.0.1:6221");
+    chord_state_2.set_stabilize_interval(TESTING_STABILIZE_INTERVAL);
+    chord_state_2.set_fix_fingers_interval(TESTING_FIX_FINGERS_INTERVAL);
     let mut handle_2 = chord_state_2
         .join(vec!["127.0.0.1:6220".into()])
         .await
@@ -79,6 +85,10 @@ async fn two_nodes_establish_alias() {
 
     // wait for things to settle
     sleep(Duration::from_secs(10)).await;
+
+    // show state
+    handle_1.debug().await.unwrap();
+    handle_2.debug().await.unwrap();
 
     // check node 1's successor
     let node_1_successor  = handle_1.successor().await.expect("node should be running");
@@ -93,16 +103,18 @@ async fn two_nodes_establish_alias() {
     // establish alias
     let alias_id = ChordPrivateKey::generate();
     let pub_key = alias_id.get_public_key();
-    let mut listener = handle_1.listen_at(alias_id).await.expect("failed to establish a listen channel");
+    let mut listen_handle = handle_1.listen_at(alias_id).await.expect("failed to establish a listen channel");
 
     // wait for things to settle
-    sleep(Duration::from_secs(5)).await;
+    sleep(Duration::from_secs(25)).await;
     trace!("----- Sending test message -----");
 
     let msg = String::from("Test Message!").as_bytes().to_vec();
-    handle_2.connect_to(pub_key, msg.clone()).await.expect("failed to connect to channel");
+    // handle_2.connect_to(pub_key, msg.clone()).await.expect("failed to connect to channel");
+    let send_handle = handle_2.connect_to(pub_key);
+    send_handle.send(msg.clone()).await.expect("Failed to send through channel");
 
-    let recvd_msg = listener.recv().await.expect("should recv sent message");
+    let recvd_msg = listen_handle.recv().await.expect("should recv sent message");
     assert_eq!(msg, recvd_msg, "recvd_msg should be equal to the sent message");
 
     sleep(Duration::from_secs(5)).await;

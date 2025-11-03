@@ -1,5 +1,10 @@
-
-use tokio::{sync::{mpsc::{channel, Receiver, Sender}, oneshot}, task::JoinHandle};
+use tokio::{
+    sync::{
+        mpsc::{channel, Receiver, Sender},
+        oneshot,
+    },
+    task::JoinHandle,
+};
 use tracing::trace;
 
 use crate::{
@@ -26,7 +31,7 @@ impl ChordHandle {
             key,
             sender,
             receiver,
-            join_handle
+            join_handle,
         }
     }
 
@@ -34,20 +39,17 @@ impl ChordHandle {
         &self.key
     }
 
-    pub async fn listen_at(&self, at: ChordPrivateKey ) -> ChordResult<Receiver<Vec<u8>>> {
+    pub async fn listen_at(&self, at: ChordPrivateKey) -> ChordResult<Receiver<Vec<u8>>> {
         let (tx, rx) = channel(8);
         self.sender
             .send(Message::Control(ControlMessage::ListenAt(at, tx)))
             .await
             .wrap()?;
-            Ok(rx)
+        Ok(rx)
     }
 
-    pub async fn connect_to(&self, to: ChordPublicKey, msg: Vec<u8>) -> ChordResult {
-        self.sender
-            .send(Message::Control(ControlMessage::ConnectTo(to, msg)))
-            .await
-            .wrap()
+    pub fn connect_to(&self, to: ChordPublicKey) -> SenderHandle {
+        SenderHandle::new(self.sender.clone(), to)
     }
 
     pub async fn recv(&mut self) -> ChordResult<Vec<u8>> {
@@ -59,19 +61,34 @@ impl ChordHandle {
 
     pub async fn predecessor(&mut self) -> ChordResult<Option<ChordPublicKey>> {
         let (tx, rx) = oneshot::channel();
-        self.sender.send(Message::Control(ControlMessage::Predecessor(tx))).await.wrap()?;
+        self.sender
+            .send(Message::Control(ControlMessage::Predecessor(tx)))
+            .await
+            .wrap()?;
         rx.await.wrap()
     }
 
     pub async fn successor(&mut self) -> ChordResult<Option<ChordPublicKey>> {
         let (tx, rx) = oneshot::channel();
-        self.sender.send(Message::Control(ControlMessage::Successor(tx))).await.wrap()?;
+        self.sender
+            .send(Message::Control(ControlMessage::Successor(tx)))
+            .await
+            .wrap()?;
         rx.await.wrap()
     }
 
-    pub async fn get_predecessor<L: Into<ChordLocation>>(&mut self, location: L) -> ChordResult<ChordPublicKey> {
+    pub async fn get_predecessor<L: Into<ChordLocation>>(
+        &mut self,
+        location: L,
+    ) -> ChordResult<ChordPublicKey> {
         let (tx, rx) = oneshot::channel();
-        self.sender.send(Message::Control(ControlMessage::PredecessorOf(tx, location.into()))).await.wrap()?;
+        self.sender
+            .send(Message::Control(ControlMessage::PredecessorOf(
+                tx,
+                location.into(),
+            )))
+            .await
+            .wrap()?;
         rx.await.wrap()
     }
 
@@ -89,5 +106,23 @@ impl ChordHandle {
 
     pub async fn get_termination_status(self) -> ChordResult {
         self.join_handle.await.unwrap()
+    }
+}
+
+pub struct SenderHandle {
+    sender: Sender<Message>,
+    to: ChordPublicKey,
+}
+
+impl SenderHandle {
+    fn new(sender: Sender<Message>, to: ChordPublicKey) -> Self {
+        Self { sender, to }
+    }
+
+    pub async fn send(&self, msg: Vec<u8>) -> ChordResult {
+        self.sender
+            .send(Message::Control(ControlMessage::ConnectTo(self.to.get_location(), msg)))
+            .await
+            .wrap()
     }
 }

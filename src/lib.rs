@@ -5,7 +5,6 @@ mod error;
 mod listener;
 mod message;
 mod peer;
-mod listen_entry;
 mod connections;
 mod requests;
 mod alias;

@@ -73,6 +73,12 @@ pub enum ErrorKind {
     /// Failed to deserialize some data
     Deserialize,
 
+    /// Failed to encrypt some data
+    Encrypt,
+
+    /// Failed to decrypt some data
+    Decrypt,
+
     /// The chord was not able to load its state
     LoadFailure,
 
@@ -85,6 +91,12 @@ pub enum ErrorKind {
 
     /// The listener handler for the address and id type failed to start
     ListenerHandlerFailed,
+
+    /// The referenced alias does not exist
+    NoSuchAlias,
+
+    /// Unable to verify the owner of an alias
+    AliasOwner,
 
     /// The chord has stopped and cannot process more messages.
     ChordStopped,
@@ -149,10 +161,14 @@ impl Display for ChordError {
                 ErrorKind::Timeout => write!(f, "Timeout"),
                 ErrorKind::Serialize => write!(f, "Serialize, invalid message could not serialize"),
                 ErrorKind::Deserialize => write!(f, "Deserialize, invalid message could not deserialize"),
+                ErrorKind::Encrypt => write!(f, "Encrypt, failed to encrypt the data"),
+                ErrorKind::Decrypt => write!(f, "Decrypt, invalid message could not decrypt"),
                 ErrorKind::LoadFailure => write!(f, "LoadFailure, could not load chord state from the disk"),
                 ErrorKind::SaveFailure => write!(f, "SaveFailure, could not save chord state to the disk"),
                 ErrorKind::FailedToConnect => write!(f, "FailedToConnect, could not join chord, could not connect to a node"),
                 ErrorKind::ListenerHandlerFailed => write!(f, "ListenerHandlerFailed, the listen handler for this address and id type failed to start"),
+                ErrorKind::NoSuchAlias => write!(f, "NoSuchAlias, the referenced alias does not exist"),
+                ErrorKind::AliasOwner => write!(f, "AliasOwner, not able to verify that an operation came from the alias's owner"),
                 ErrorKind::ChordStopped => write!(f, "ChordStopped, the chord has stopped and will no longer process messages"),
                 ErrorKind::AssociateCreationFailed => write!(f, "AssociateCreationFailed, failed to create an associate connection"),
                 ErrorKind::AssociateConnectionFailed => write!(f, "AssociateConnectionFailed, failed to connect to the node as an associate"),

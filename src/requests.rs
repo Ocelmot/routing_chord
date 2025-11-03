@@ -22,6 +22,7 @@ const EXPIRATION_LIMIT: Duration = Duration::from_secs(180);
 
 pub struct Requests {
     self_id: ChordPrivateKey,
+    self_pub: ChordPublicKey,
 
     pending_replies: HashMap<u64, (u64, ChordLocation, Instant)>,
     our_requests: HashMap<u64, (Request, Instant)>,
@@ -38,7 +39,8 @@ impl Requests {
         span: &Span,
     ) -> Self {
         Self {
-            self_id,
+            self_id: self_id.clone(),
+            self_pub: self_id.get_public_key(),
 
             pending_replies: HashMap::new(),
             our_requests: HashMap::new(),
@@ -48,30 +50,7 @@ impl Requests {
         }
     }
 
-    // Possibly the below need to be redone
-
-    /// Creates and routes an alias operation through the chord network.
-    #[deprecated]
-    pub(crate) async fn route_alias_op(
-        &mut self,
-        connections: &mut Connections,
-        to: &ChordPublicKey,
-        from: &ChordPrivateKey,
-        msg: AliasOperation,
-    ) {
-        let serialized = bincode::serialize(&msg).expect("AliasOperations should serialize");
-        let sig = from.sign(&serialized).to_vec();
-        let msg = MemberMessage::AliasOperation {
-            to: to.clone(),
-            from: from.get_public_key(),
-            op: serialized,
-            sig,
-        };
-        connections.route_msg(to, &msg).await;
-    }
-
     // Request functions
-
     pub async fn send_request(&mut self, connections: &mut Connections, req: Request) {
         let new_id: u64 = random();
         self.our_requests
@@ -159,17 +138,23 @@ impl Requests {
         return Some((cache_key, cache_addr));
     }
 
+    /// Gets the predecessor of some ChordLocation, or if it does not have it requests it from the chord
     pub async fn fetch_predecessor_of<L: Into<ChordLocation>>(
         &mut self,
         connections: &mut Connections,
         location: L,
-    ) -> Option<(&ChordPublicKey, &String)> {
+    ) -> Option<(&ChordPublicKey, &str)> {
         let location = location.into();
         if let Some((_, _, cache_time)) = self.cache.get(&location) {
             if *cache_time + EXPIRATION_LIMIT < Instant::now() {
                 trace!("cache entry expired");
                 self.cache.remove(&location);
             }
+        }
+
+        // if the predecessor is us
+        if connections.in_controlled_sector(location.clone()) {
+            return Some((&self.self_pub, "localhost"));
         }
 
         if !self.cache.contains_key(&location) {
@@ -181,7 +166,7 @@ impl Requests {
 
         self.cache
             .get(&location)
-            .map(|(cache_key, cache_addr, _)| (cache_key, cache_addr))
+            .map(|(cache_key, cache_addr, _)| (cache_key, cache_addr.as_str()))
     }
 
     // Handlers
@@ -194,7 +179,7 @@ impl Requests {
         location: ChordLocation,
     ) {
         if connections.in_controlled_sector(location.clone()) {
-            trace!(parent: &self.span, "Replying");
+            trace!(parent: &self.span, "Replying to request({}) from {:?}", req_id, from);
             // reply
             if let Some(addr) = pub_addr {
                 let reply = Reply::predecessor_of(&self.self_id, location.clone(), addr.clone());

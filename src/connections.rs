@@ -4,14 +4,11 @@ use std::{
     ops::Bound::{Excluded, Included, Unbounded},
 };
 
-use tokio::sync::mpsc::Sender;
+use tokio::sync::mpsc::{Sender, error::TrySendError};
 use tracing::{error, trace, warn, Span};
 
 use crate::{
-    id::{ChordLocation, ChordPrivateKey, ChordPublicKey},
-    listener::process_connection_type,
-    message::{AssociateMessage, MemberMessage, Message},
-    peer::{connect, PeerWriter},
+    alias::{AliasId, AliasOperation}, error::ChordResult, id::{ChordLocation, ChordPrivateKey, ChordPublicKey}, listener::process_connection_type, message::{AssociateMessage, MemberMessage, Message}, peer::{connect, PeerWriter}
 };
 
 const MAX_TRAIL_LENGTH: u8 = 5;
@@ -49,6 +46,10 @@ impl Connections {
         }
     }
 
+    pub(crate) fn self_id(&self) -> &ChordPrivateKey {
+        &self.self_id
+    }
+
     pub(crate) fn listen_port(&self) -> u16 {
         self.listen_port
     }
@@ -80,7 +81,7 @@ impl Connections {
                 trace!(parent: &span, "Connected to {}, processing", addr);
                 trace!(parent: &span, "spawn inner channel closed: {}", queue_tx.is_closed());
                 process_connection_type(queue_tx, connection);
-            }else{
+            } else {
                 error!(parent: span, "Failed to connect to {}", addr);
             }
         });
@@ -98,19 +99,19 @@ impl Connections {
     }
 
     pub fn members(&self) -> impl Iterator<Item = &ChordPublicKey> {
-        self.members.iter().map(|(_, x)|{x.other_id()})
+        self.members.iter().map(|(_, x)| x.other_id())
     }
 
-    pub fn member_addr<L: Into<ChordLocation>>(&self, location: L) -> Option<String>{
-        self.members.get(&location.into()).map(|member|{
-            member.other_addr()
-        })
+    pub fn member_addr<L: Into<ChordLocation>>(&self, location: L) -> Option<String> {
+        self.members
+            .get(&location.into())
+            .map(|member| member.other_addr())
     }
 
-    pub fn member_listen_addr<L: Into<ChordLocation>>(&self, location: L) -> Option<SocketAddr>{
-        self.members.get(&location.into()).map(|member|{
-            member.listen_addr()
-        })
+    pub fn member_listen_addr<L: Into<ChordLocation>>(&self, location: L) -> Option<SocketAddr> {
+        self.members
+            .get(&location.into())
+            .map(|member| member.listen_addr())
     }
 
     pub fn is_connected_to(&self, addr: SocketAddr) -> bool {
@@ -123,15 +124,19 @@ impl Connections {
     }
 
     pub(crate) fn determine_pub_addr(&self) -> Option<String> {
+        trace!(parent: &self.span, "Determining public address");
         let mut addrs = HashMap::<&IpAddr, usize>::new();
         for (_, member) in &self.members {
             let count = addrs.entry(member.pub_addr()).or_default();
             *count += 1;
         }
-        addrs
+        let addr = addrs
             .iter()
             .max_by(|(_, a), (_, b)| a.cmp(b))
-            .map(|(addr, _)| (*addr).to_string())
+            .map(|(addr, _)| (*addr).to_string());
+
+        trace!(parent: &self.span, "Determined public address to be {:?}", addr);
+        addr
     }
 
     pub(crate) fn predecessor_key(&self) -> Option<ChordPublicKey> {
@@ -193,6 +198,22 @@ impl Connections {
             // if there is no successor, this is the only node, which means it
             // owns the whole chord
             true
+        }
+    }
+
+    /// sends a message back to the main queue as if this node had sent the
+    /// message over the network.
+    pub(crate) fn send_self(&self, msg: MemberMessage){
+        match self.queue_tx.try_send(Message::Member(self.self_id.get_public_key(), msg)) {
+            Ok(_) => {},
+            Err(TrySendError::Full(msg)) => {
+                // stupid
+                let sender = self.queue_tx.clone();
+                tokio::spawn(async move{
+                    sender.send(msg).await;
+                });
+            },
+            Err(TrySendError::Closed(_)) => {}
         }
     }
 
@@ -265,7 +286,8 @@ impl Connections {
         msg: &MemberMessage,
     ) -> bool {
         let target = to.into();
-        trace!(
+        let span = self.span.clone();
+        trace!(parent: &span,
             "routing message from {:?} to {:?}, member count: {}",
             self.self_location,
             target,
@@ -287,6 +309,7 @@ impl Connections {
                     match member.write(msg).await {
                         Ok(_) => return true,
                         Err(_) => {
+                            trace!(parent: &span, "connection errored, trying next");
                             let loc = member_location.clone();
                             // remove member and try again
                             self.members.remove(&loc);
@@ -304,6 +327,7 @@ impl Connections {
                     match member.write(msg).await {
                         Ok(_) => return true,
                         Err(_) => {
+                            trace!(parent: &span, "connection errored, trying next");
                             let loc = member_location.clone();
                             // remove member and try again
                             self.members.remove(&loc);
@@ -321,6 +345,7 @@ impl Connections {
                     match member.write(msg).await {
                         Ok(_) => return true,
                         Err(_) => {
+                            trace!(parent: &span, "connection errored, trying next");
                             let loc = member_location.clone();
                             // remove member and try again
                             self.members.remove(&loc);
@@ -329,9 +354,34 @@ impl Connections {
                     }
                 }
             }
-            trace!("Did not send, no connections");
+            trace!(parent: &span, "Did not send, no connections between self and target, remaining members: {}", self.members.len());
             return false;
         }
+    }
+
+    /// Creates and routes an alias operation through the chord network.
+    pub(crate) async fn route_alias_op(
+        &mut self,
+        to: &ChordPublicKey,
+        from: &ChordPrivateKey,
+        op: AliasOperation,
+    ) -> ChordResult {
+        let serialized = op.serialize();
+        let encrypted = to.encrypt_chunked(&serialized)?;
+        let sig = from.sign(&encrypted).to_vec();
+
+        let msg = MemberMessage::AliasOperation {
+            to: to.get_location(),
+            from: from.get_public_key(),
+            op: encrypted,
+            sig,
+        };
+        if to == &self.self_id.get_public_key() {
+            self.send_self(msg);
+        }else{
+            self.route_msg(to, &msg).await;
+        }
+        Ok(())
     }
 
     /// Route a message to a location. This will route the message to the
@@ -342,11 +392,11 @@ impl Connections {
     pub(crate) async fn route_data(
         &mut self,
         to: ChordLocation,
-        alias_id: ChordLocation,
+        alias_loc: ChordLocation,
         hop_count: Option<u8>,
         data: Vec<u8>,
     ) {
-        trace!("Routing data");
+        trace!(parent: &self.span, "connection routing data");
         // is the data routing normally, or in the trail?
         if let Some(hop_count) = hop_count {
             // routing in the trail
@@ -355,9 +405,10 @@ impl Connections {
             }
             let msg = MemberMessage::Data {
                 to,
-                alias_id,
+                // alias_id,
+                alias_loc,
                 hop_count: Some(hop_count + 1),
-                data,
+                body: data,
             };
             self.predecessor_send(&msg).await;
         } else {
@@ -366,17 +417,19 @@ impl Connections {
             if self.in_controlled_sector(to.clone()) {
                 let msg = MemberMessage::Data {
                     to,
-                    alias_id,
+                    // alias_id,
+                    alias_loc,
                     hop_count: Some(0),
-                    data,
+                    body: data,
                 };
                 self.predecessor_send(&msg).await;
             } else {
                 let msg = MemberMessage::Data {
                     to: to.clone(),
-                    alias_id,
+                    // alias_id,
+                    alias_loc,
                     hop_count,
-                    data,
+                    body: data,
                 };
                 self.route_msg(to, &msg).await;
             }

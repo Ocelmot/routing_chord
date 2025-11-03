@@ -14,10 +14,10 @@ use tokio::{
     task::JoinHandle,
     time::{interval, MissedTickBehavior},
 };
-use tracing::{debug, error, instrument, span, trace, warn, Level, Span};
+use tracing::{debug, error, info, instrument, span, trace, Level, Span};
 
 use crate::{
-    alias::manager::Aliases,
+    alias::manager::{Aliases, DEFAULT_LISTEN_PATH_LENGTH},
     connections::Connections,
     error::{ChordError, ChordResult, ErrorKind, ProblemWrap},
     id::{ChordLocation, ChordPrivateKey, ChordPublicKey},
@@ -60,8 +60,8 @@ impl ChordProcessor {
         let self_id = ChordPrivateKey::generate();
         let span = span!(
             Level::DEBUG,
-            "Routing Chord",
-            location = format!("{:#?}", self_id.get_location())
+            "Chord",
+            AT = format!("{:#?}", self_id.get_location())
         );
         let (recv_queue, recv_rx) = channel(50);
         let (queue_tx, queue_rx) = channel(25);
@@ -160,7 +160,7 @@ impl ChordProcessor {
         // add the first connection
         processor.connections.add_member(first_member);
 
-        let join_handle = processor.run();   
+        let join_handle = processor.run();
         Ok(ChordHandle::new(pub_key, queue_tx, recv_rx, join_handle))
     }
 
@@ -278,24 +278,27 @@ impl ChordProcessor {
             }
             ControlMessage::ListenAt(alias_key, sender) => {
                 trace!(parent: &self.span, "ListenAt");
-                // set up listener entry, send request for predecessor
-                let pred = self
-                    .requests
-                    .fetch_predecessor_of(&mut self.connections, alias_key.get_location())
-                    .await
-                    .map(|(x, _)| x.clone());
-                trace!(parent: &self.span, "Added listener to listen paths with predecessor {:?}", pred);
-                self.aliases.listen_at(alias_key, pred, sender);
+                self.aliases
+                    .listen_at(
+                        &mut self.connections,
+                        &mut self.requests,
+                        alias_key,
+                        sender,
+                        DEFAULT_LISTEN_PATH_LENGTH,
+                    )
+                    .await;
             }
-            ControlMessage::ConnectTo(alias_id, msg) => {
+            ControlMessage::ConnectTo(conn_loc, msg) => {
                 trace!("ConnectTo");
-                let alias_id = alias_id.get_location();
-                // if let Some(alias_entry) = self.listen_paths.get(&alias_id) {
-                //     let wrapped = alias_entry.unwrap(ciphertext);
-                // }
 
-                self.connections
-                    .route_data(alias_id.clone(), alias_id, None, msg)
+                self.aliases
+                    .process_data(
+                        &mut self.connections,
+                        conn_loc,
+                        self.self_id.get_location(),
+                        Some(4),
+                        msg,
+                    )
                     .await;
             }
             ControlMessage::Predecessor(sender) => {
@@ -381,8 +384,6 @@ impl ChordProcessor {
                     // only respond to these messages from our successor
                     if id.get_location() == s_loc.get_location() {
                         debug!(parent: &span, "Connecting to {}", addr);
-                        debug!(parent: &span, "channel closed: {}", self.queue_tx.is_closed());
-                        debug!(parent: &span, "channel compare {}", self.queue_tx.same_channel(self.connections.channel_ref()));
                         self.connections.connect_to(addr);
                     } else {
                         debug!(parent: &span, "Addr did not come from successor");
@@ -400,18 +401,43 @@ impl ChordProcessor {
             MemberMessage::Pong => {} // the ping-pong is complete
             MemberMessage::AliasOperation { to, from, op, sig } => {
                 self.aliases
-                    .handle_operation(&mut self.connections, to, from, op, sig)
+                    .handle_operation(&mut self.connections, &mut self.requests, to, from, op, sig)
                     .await;
+            }
+            MemberMessage::AliasResponse {
+                to,
+                from,
+                data,
+            } => {
+                if to == self.self_id.get_location() {
+                    trace!(parent: &self.span, "processor got AliasResponse");
+                    let result = self.aliases
+                        .handle_response(&mut self.connections, to, from, data)
+                        .await;
+                    trace!("result of alias response = {:?}", result);
+                } else {
+                    self.connections
+                        .route_msg(
+                            to.clone(),
+                            &MemberMessage::AliasResponse {
+                                to,
+                                from,
+                                // sig,
+                                data,
+                            },
+                        )
+                        .await;
+                }
             }
             MemberMessage::Data {
                 to,
-                alias_id,
+                alias_loc,
                 hop_count,
-                data,
+                body: data,
             } => {
-                trace!("Routing data");
+                trace!(parent: &self.span, "processor routing data");
                 self.aliases
-                    .process_data(&mut self.connections, to, alias_id, hop_count, data)
+                    .process_data(&mut self.connections, to, alias_loc, hop_count, data)
                     .await;
             }
         }
@@ -420,9 +446,9 @@ impl ChordProcessor {
 
     #[instrument(parent = &self.span, level="debug", name="Notify", skip(self, id))]
     async fn process_notify(&mut self, id: ChordPublicKey) {
-        debug!("Notified from {:#?}", id.get_location());
+        // debug!("Notified from {:#?}", id.get_location());
         let Some(peer_listen_addr) = self.connections.member_listen_addr(&id) else {
-            debug!("failed to get member for {:#?}", id.get_location());
+            // debug!("failed to get member for {:#?}", id.get_location());
             return;
         };
 
@@ -430,19 +456,19 @@ impl ChordProcessor {
             // let location = id.get_location();
             if id.get_location().is_in_open_sector(pred_key, &self.self_id) {
                 // notify came from a node between our predecessor and us, we should update
-                debug!("notify came from closer than actual predecessor, updating this nodes pred");
+                // debug!("notify came from closer than actual predecessor, updating this nodes pred");
                 self.predecessor = Some((id, peer_listen_addr.to_string()));
             } else if id == *pred_key {
-                debug!("notify came from actual predecessor, no need to update");
+                // debug!("notify came from actual predecessor, no need to update");
                 // notify came from our predecessor, all is well
             } else {
                 // notify came from a node behind our predecessor, inform them of our predecessor
                 // let msg = MemberMessage::PredecessorOf { to: (), of: (), key: (), addr: (), sig: () };
-                debug!(
-                    "sending predecessor_addr {} to {:#?}",
-                    pred_addr,
-                    id.get_location()
-                );
+                // debug!(
+                //     "sending predecessor_addr {} to {:#?}",
+                //     pred_addr,
+                //     id.get_location()
+                // );
 
                 self.connections
                     .member_send(&id, &MemberMessage::PredecessorAddr(pred_addr.clone()))
@@ -450,10 +476,10 @@ impl ChordProcessor {
             }
         } else {
             // We currently have no predecessor, we will use the incoming one
-            debug!(
-                "this node has no predecessor, assigning from notify. addr={}",
-                peer_listen_addr.to_string()
-            );
+            // debug!(
+            //     "this node has no predecessor, assigning from notify. addr={}",
+            //     peer_listen_addr.to_string()
+            // );
             self.predecessor = Some((id, peer_listen_addr.to_string()));
         }
     }
@@ -490,14 +516,13 @@ impl ChordProcessor {
                     .member_send(&key, &MemberMessage::Ping)
                     .await;
             } else {
-                
                 self.connections.connect_to(addr);
             }
         }
 
         // if this response could satisfy a listen path
-        self.aliases
-            .handle_predecessor_of(&mut self.connections, &mut self.requests, &of, &key)
+        let _ = self.aliases
+            .handle_predecessor_of(&mut self.connections, &of, &key)
             .await;
 
         // If this response could satisfy a request
@@ -540,7 +565,7 @@ impl ChordProcessor {
 
     async fn process_successor_of(&mut self, of: ChordLocation, key: ChordPublicKey, addr: String) {
         trace!("Got SuccessorOf");
-        // TODO: Why do we want to know the successor?
+        todo!("Why do we want to know the successor?");
     }
 
     async fn process_associate_msg(
@@ -555,7 +580,7 @@ impl ChordProcessor {
     /// Sequence: stabilize -> get_predecessor -> predecessor -> notify
     #[instrument(parent = &self.span, level="debug", name="Stabilize", skip(self))]
     async fn stabilize(&mut self) -> ChordResult {
-        debug!("Stabilizing");
+        // debug!("Stabilizing");
         // notify our successor. If we are not the successor's predecessor it
         // will reply with its predecessor so we could establish the connection
         if let Some(successor) = self.connections.successor_key() {
@@ -604,6 +629,8 @@ impl ChordProcessor {
 
     async fn handle_pending(&mut self) {
         // process pending connection requests
+        info!(parent: &self.span, "Node handling pending operations");
+        info!(parent: &self.span, "queue len {}", self.queue_rx.len());
         let expired = self.requests.resend_pending(&mut self.connections).await;
         for request in expired {
             match request {
@@ -614,9 +641,9 @@ impl ChordProcessor {
             }
         }
 
-        //
-        self.aliases
-            .handle_pending(&mut self.connections, &mut self.requests)
-            .await;
+        // Use this to make sure that paths are built or can be rebuilt
+        // let _ = self.aliases
+        //     .handle_pending(&mut self.connections, &mut self.requests)
+        //     .await;
     }
 }

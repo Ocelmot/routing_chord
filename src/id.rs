@@ -1,4 +1,4 @@
-use std::cmp::Ordering;
+use std::{cmp::Ordering, fmt::Debug};
 
 use num_bigint::BigUint;
 use rand::thread_rng;
@@ -11,6 +11,7 @@ use rsa::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tracing::trace;
 
 use crate::error::{ChordResult, ErrorKind, ProblemWrap};
 
@@ -18,7 +19,10 @@ const KEY_SIZE: usize = 2048;
 pub(crate) const LOCATION_BYTE_SIZE: usize = 32;
 pub(crate) const LOCATION_BIT_SIZE: u32 = LOCATION_BYTE_SIZE as u32 * 8;
 
-#[derive(Debug, Clone)]
+const ENCRYPTION_CHUNK_SIZE: usize = 245;
+const ENCRYPTION_RESULT_SIZE: usize = 256;
+
+#[derive(Clone)]
 pub struct ChordPrivateKey {
     key: RsaPrivateKey,
 }
@@ -41,11 +45,27 @@ impl ChordPrivateKey {
         self.get_public_key().encrypt(msg)
     }
 
+    pub fn encrypt_chunked(&self, msg: &[u8]) -> ChordResult<Vec<u8>> {
+        self.get_public_key().encrypt_chunked(msg)
+    }
+
     pub fn decrypt(&self, msg: &[u8]) -> ChordResult<Vec<u8>> {
         let decrypting_key = DecryptingKey::new(self.key.clone());
         decrypting_key
             .decrypt_with_rng(&mut thread_rng(), msg)
             .wrap()
+    }
+
+    pub fn decrypt_chunked(&self, msg: &[u8]) -> ChordResult<Vec<u8>> {
+        let decrypting_key = DecryptingKey::new(self.key.clone());
+        let mut result = Vec::new();
+        for chunk in msg.chunks(ENCRYPTION_RESULT_SIZE) {
+            let decrypted = decrypting_key
+                .decrypt_with_rng(&mut thread_rng(), chunk)
+                .wrap()?;
+            result.extend_from_slice(&decrypted);
+        }
+        Ok(result)
     }
 
     pub fn sign(&self, data: &[u8]) -> [u8; 256] {
@@ -63,9 +83,15 @@ impl ChordPrivateKey {
     }
 }
 
+impl Debug for ChordPrivateKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "PRIV:{:#?}", self.get_location())
+    }
+}
+
 // ===== Chord Public Key =====
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ChordPublicKey {
     key: RsaPublicKey,
 }
@@ -98,6 +124,19 @@ impl ChordPublicKey {
             .wrap()
     }
 
+    pub fn encrypt_chunked(&self, msg: &[u8]) -> ChordResult<Vec<u8>> {
+        let mut result = Vec::new();
+        for chunk in msg.chunks(ENCRYPTION_CHUNK_SIZE) {
+            let encrypted = self.key
+                .encrypt(&mut thread_rng(), Pkcs1v15Encrypt, chunk)
+                .wrap()?;
+
+            result.extend_from_slice(&encrypted);
+        }
+
+        Ok(result)
+    }
+
     pub fn verify(&self, msg: &[u8], sig: &[u8]) -> bool {
         let verifying_key = VerifyingKey::<Sha256>::new(self.key.clone());
         match Signature::try_from(sig) {
@@ -117,14 +156,11 @@ impl Ord for ChordPublicKey {
     }
 }
 
-// impl Display for ChordPublicKey {
-//     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-//         for byte in self.sha256() {
-//             write!(f, "{:02X?}", byte)?;
-//         }
-//         Ok(())
-//     }
-// }
+impl Debug for ChordPublicKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "PUB:{:#?}", self.get_location())
+    }
+}
 
 // ===== ChordLocation =====
 
@@ -236,12 +272,23 @@ impl From<&ChordPublicKey> for ChordLocation {
 
 impl std::fmt::Debug for ChordLocation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let width = f.width().unwrap_or(3);
         if !f.alternate() {
-            write!(f, "ChordLocation: ")?;
+            write!(f, "LOC:")?;
         }
-        for byte in self.num.to_bytes_be() {
-            write!(f, "{:02X?}", byte)?;
+        if width <= self.num.to_bytes_be().len()  {
+            for byte in &self.num.to_bytes_be()[0..width] {
+                write!(f, "{:02X?}", byte)?;
+            }
+        }else{
+            for byte in self.num.to_bytes_be() {
+                write!(f, "{:02X?}", byte)?;
+            }
+            for _ in 0..width - self.num.to_bytes_be().len(){
+                write!(f, " ")?;
+            }
         }
+
         Ok(())
     }
 }
@@ -250,12 +297,11 @@ impl std::fmt::Debug for ChordLocation {
 mod tests {
 
     use rand::random;
-    use tracing_test::traced_test;
 
     use super::*;
 
     #[test]
-    #[traced_test]
+    #[test_log::test]
     fn signature_round_trip() {
         let data: [u8; 10] = random();
         let id = ChordPrivateKey::generate();
@@ -268,7 +314,7 @@ mod tests {
     }
 
     #[test]
-    #[traced_test]
+    #[test_log::test]
     fn signature_failure() {
         let data: [u8; 10] = random();
         let id = ChordPrivateKey::generate();
@@ -283,7 +329,7 @@ mod tests {
     }
 
     #[test]
-    #[traced_test]
+    #[test_log::test]
     fn signature_data_change() {
         let mut data: [u8; 10] = random();
         let id = ChordPrivateKey::generate();
@@ -299,5 +345,66 @@ mod tests {
 
         // verify
         assert!(!id.get_public_key().verify(&data, &signature));
+    }
+
+    #[test]
+    #[test_log::test]
+    fn enc_round_trip_rand() {
+        let data = {
+            (0..1000).map(|_|random::<u8>()).collect::<Vec<_>>()
+        };
+        let id = ChordPrivateKey::generate();
+
+        // encrypt
+        let enc = id.get_public_key().encrypt_chunked(&data).expect("message failed to encrypt");
+
+        // decrypt
+        let dec = id.decrypt_chunked(&enc).expect("message failed to decrypt");
+
+        // Assert round trip
+        assert!(data == dec);
+    }
+
+    
+    #[test]
+    #[test_log::test]
+    fn enc_round_trip_ff() {
+        let data = {
+            (0..1000).map(|_|0xffu8).collect::<Vec<_>>()
+        };
+        let id = ChordPrivateKey::generate();
+
+        // encrypt
+        let enc = id.get_public_key().encrypt_chunked(&data).expect("message failed to encrypt");
+
+        // decrypt
+        let dec = id.decrypt_chunked(&enc).expect("message failed to decrypt");
+
+        // Assert round trip
+        assert!(data == dec);
+    }
+
+    #[test]
+    #[test_log::test]
+    fn enc_data_change() {
+        let data = {
+            (0..1000).map(|_|random::<u8>()).collect::<Vec<_>>()
+        };
+        let id = ChordPrivateKey::generate();
+
+        // encrypt
+        let mut enc = id.get_public_key().encrypt_chunked(&data).expect("message failed to encrypt");
+
+        // corrupt byte
+        let index = random::<usize>() % enc.len();
+        let mut corruption = random();
+        while enc[index] == corruption {
+            corruption = random();
+        }
+        enc[index] = corruption;
+
+        // decrypt should fail
+        assert!(id.decrypt_chunked(&enc).is_err());
+
     }
 }

@@ -4,10 +4,8 @@ use routing_chord::ChordState;
 
 use tokio::time::sleep;
 
-use tracing_test::traced_test;
-
 #[tokio::test]
-#[traced_test]
+#[test_log::test]
 async fn disconnected_query_predecessor() {
     let mut chord_state_1 = ChordState::temp();
     chord_state_1.set_listen_addr("127.0.0.1:6100");
@@ -22,7 +20,7 @@ async fn disconnected_query_predecessor() {
 }
 
 #[tokio::test]
-#[traced_test]
+#[test_log::test]
 async fn disconnected_query_successor() {
     let mut chord_state_1 = ChordState::temp();
     chord_state_1.set_listen_addr("127.0.0.1:6101");

@@ -44,14 +44,12 @@ where
             PeerWriterType::Member(writer) => ControlMessage::AddMember(writer),
             PeerWriterType::Associate(writer) => ControlMessage::AddAssociate(writer),
         };
-        trace!("process_connection_type sending {:?}", ctrl_msg);
 
         sender
             .send(Message::Control(ctrl_msg))
             .await
             .problem_wrap(ErrorKind::ChordStopped).expect("Sender channel should be open when chord is running");
 
-        trace!("process_connection_type looping");
         // loop to recv messages
         loop {
             let msg = match &mut reader {
@@ -101,7 +99,6 @@ async fn process_message(
 mod tests {
     use tokio::{net::TcpListener, sync::mpsc::channel};
     use tracing::info;
-    use tracing_test::traced_test;
 
     use crate::{
         message::{AssociateMessage, MemberMessage},
@@ -111,7 +108,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    #[traced_test]
+    #[test_log::test]
     async fn member_round_trip() {
         let ip_addr = "127.0.0.1:6000";
         let conn_priv_id = ChordPrivateKey::generate();
@@ -164,7 +161,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[traced_test]
+    #[test_log::test]
     async fn associate_round_trip() {
         let ip_addr = "127.0.0.1:6001";
         let conn_priv_id = ChordPrivateKey::generate();
